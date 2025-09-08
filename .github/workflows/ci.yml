@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    name: Snakemake dry-run
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup micromamba (for Snakemake)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          micromamba-version: "latest"
+          cache-downloads: true
+          cache-env: true
+          init-shell: bash
+          environment-name: snakemake
+          create-args: >-
+            -c conda-forge -c bioconda
+            snakemake=8.*
+
+      - name: Show versions
+        run: |
+          micromamba run -n snakemake snakemake --version
+          python --version
+
+      - name: Prepare tiny test data & config for dry-run
+        run: bash tests/ci-setup.sh
+
+      - name: Lint Snakefile (optional)
+        run: micromamba run -n snakemake snakemake --lint || true
+
+      - name: Parse & list rules
+        run: micromamba run -n snakemake snakemake --list-rules
+
+      - name: Dry-run core targets
+        run: |
+          micromamba run -n snakemake snakemake \
+            --configfile tests/config.ci.yaml \
+            --cores 2 -n -p \
+            qiime2/demux.qzv \
+            qiime2/table.qza \
+            qiime2/rep-seqs.qza \
+            qiime2/taxonomy/taxa-barplot_primary.qzv \
+            qiime2/taxonomy/taxonomy_primary.tsv \
+            qiime2/feature-table.tsv \
+            qiime2/summary/asv_genus.tsv \
+            qiime2/summary/asv_species.tsv
+
+      - name: Dry-run GG2 targets (also using placeholders)
+        run: |
+          micromamba run -n snakemake snakemake \
+            --configfile tests/config.ci.yaml \
+            --cores 2 -n -p \
+            qiime2/taxonomy/taxonomy_gg2.qza \
+            qiime2/taxonomy/taxonomy_gg2.tsv \
+            qiime2/summary/asv_gg2_genus.tsv \
+            qiime2/summary/asv_gg2_species.tsv
+
