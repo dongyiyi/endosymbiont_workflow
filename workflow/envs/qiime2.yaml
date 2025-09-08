@@ -1,9 +1,0 @@
-channels: [qiime2, conda-forge, bioconda]
-dependencies:
-  - qiime2=2024.10
-  - q2cli
-  - q2-feature-classifier
-  - q2-taxa
-  - q2-dada2
-  - q2-phylogeny
-  - rescript
