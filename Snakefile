@@ -1,96 +1,97 @@
 # Snakemake workflow: QC → Cutadapt → QIIME2 (DADA2) → Taxonomy (SILVA + GG2) → Concordance
 # Run:
 #   snakemake -j 8 --use-conda --configfile workflow/config.yaml
+# ================================================================
+# Endosymbiont 16S Amplicon Workflow - Snakefile (full, updated)
+# ================================================================
 
-import yaml
+import os, re, sys
 from pathlib import Path
 
-configfile: "workflow/config.yaml"
+# ---------------- Config / Paths ----------------
 cfg = config
 
-# 只允许 rank 取四个合法值，防止 asv_level_table 误匹配到 *.relabund.tsv / *.long.tsv
-wildcard_constraints:
-    rank="phylum|family|genus|species"
-
-RAW = Path(cfg["raw_dir"]).resolve()
-META = Path(cfg["metadata_tsv"]).resolve()
-OUT = Path(cfg.get("outdir", "qiime2")).resolve()
+RAW_DIR = cfg.get("raw_dir", "raw")
+META    = Path(cfg.get("metadata_tsv", "metadata/sample-metadata.tsv"))
 
 R1SFX = cfg.get("r1_suffix", "_R1.fastq.gz")
 R2SFX = cfg.get("r2_suffix", "_R2.fastq.gz")
 
-SAMPLES = sorted([p.name.replace(R1SFX,"") for p in RAW.glob(f"*{R1SFX}")])
-assert SAMPLES, f"No samples found in {RAW} matching *{R1SFX}"
+CUTADAPT_EXTRA = cfg.get("cutadapt_extra", "--minimum-length 50 -q 20,20")
 
-GG2_SEPP_REF = cfg.get("gg2", {}).get("sepp_ref_qza", "")
+# DADA2 params
+dada2_cfg = cfg.get("dada2", {})
+TRIM_LEFT_F  = int(dada2_cfg.get("trim_left_f", 0))
+TRIM_LEFT_R  = int(dada2_cfg.get("trim_left_r", 0))
+TRUNC_LEN_F  = int(dada2_cfg.get("trunc_len_f", 0))
+TRUNC_LEN_R  = int(dada2_cfg.get("trunc_len_r", 0))
 
-USE_EXISTING_QIIME = bool(cfg.get("use_existing_qiime_env", False))
-QIIME_ENV_NAME = cfg.get("qiime_env_name","qiime2-amplicon-2024.10")
+# QIIME env selection
+USE_EXISTING_QIIME = bool(cfg.get("use_existing_qiime_env", True))
+QIIME_ENV_NAME     = cfg.get("qiime_env_name", "qiime2-amplicon-2024.10")
+Q2 = ('conda run -n ' + QIIME_ENV_NAME + ' qiime') if USE_EXISTING_QIIME else 'qiime'
 
-# Convenience: run qiime consistently
-Q2 = f"conda run -n {QIIME_ENV_NAME} qiime" if USE_EXISTING_QIIME else "qiime"
+# Primary (SILVA) classifier
+PRIMARY_CLASSIFIER = Path(cfg.get("classifier_qza", "refs/V3V4-silva-138.2/silva-138.2-V3V4-uniq-classifier.qza"))
 
-def qiime(cmd):
-    if USE_EXISTING_QIIME:
-        return f"conda run -n {QIIME_ENV_NAME} qiime {cmd}"
-    else:
-        return f"qiime {cmd}"
+# Reference build params (used by build_classifier_silva)
+ref_cfg = cfg.get("reference", {})
+region_label  = ref_cfg.get("region_label", "V3V4")
+silva_version = str(ref_cfg.get("silva_version", "138.2"))
+silva_target  = ref_cfg.get("silva_target", "SSURef_NR99")
+primers       = ref_cfg.get("primers", {})
+prim_fwd      = primers.get("forward", "CCTACGGGNGGCWGCAG")
+prim_rev      = primers.get("reverse", "GACTACHVGGGTATCTAATCC")
+symbiont_list = ref_cfg.get("symbiont_list", "refs/symbiont_taxa.txt")
 
-# --- Reference / classifier settings ---
-ref = cfg.get("reference", {})
-region_label = ref.get("region_label", "V3V4")
-silva_version = str(ref.get("silva_version", "138.2"))
-silva_target = ref.get("silva_target", "SSURef_NR99")
-prim_fwd = ref.get("primers", {}).get("forward", "CCTACGGGNGGCWGCAG")
-prim_rev = ref.get("primers", {}).get("reverse", "GACTACHVGGGTATCTAATCC")
-symbiont_list = ref.get("symbiont_list", "refs/symbiont_taxa.txt")
+# GG2 (optional)
+GG2 = cfg.get("gg2", {})
+GG2_DIR  = Path(GG2.get("outdir", "refs/GG2-V3V4"))
+GG2_SEQS = GG2.get("seqs_qza")           # refs/GG2-raw/2024.09.backbone.full-length.fna.qza (used to build classifier)
+GG2_TAX  = GG2.get("tax_qza")            # refs/GG2-raw/2024.09.backbone.tax.qza
+GG2_SEPP_REF = GG2.get("sepp_ref_qza")   # refs/GG2-raw/2022.10.backbone.sepp-reference.qza  (optional)
+use_gg2 = bool(GG2_SEQS) and bool(GG2_TAX)
 
-SILVA_DIR = Path(f"refs/{region_label}-silva-{silva_version}")
-SILVA_CLASSIFIER = SILVA_DIR / f"silva-{silva_version}-{region_label}-uniq-classifier.qza"
-SILVA_UNIQ_SEQS = SILVA_DIR / f"silva-{silva_version}-{region_label}-uniq-seqs.qza"
-SILVA_UNIQ_TAX  = SILVA_DIR / f"silva-{silva_version}-{region_label}-uniq-tax.qza"
+# For OTU-97 with GG2 (closed/open reference) we need the  V3V4-uniq-seqs.qza built by your gg2 classifier rule
+if use_gg2:
+    GG2_REF_SEQS = str(GG2_DIR / "V3V4-uniq-seqs.qza")
 
-gg2 = cfg.get("gg2", {})
-GG2_SEQS = gg2.get("seqs_qza", "")
-GG2_TAX  = gg2.get("tax_qza", "")
-GG2_DIR  = Path(gg2.get("outdir", f"refs/GG2-{region_label}"))
-GG2_CLASSIFIER = GG2_DIR / f"{region_label}-uniq-classifier.qza"
+# Summary options
+summary_cfg = cfg.get("summary", {})
+GROUP_COL   = summary_cfg.get("group_column", "group")
 
-primary_classifier = Path(cfg.get("classifier_qza", str(SILVA_CLASSIFIER)))
+# Concordance options
+TOP_N = int(cfg.get("concordance", {}).get("top_n", 50))
 
-conc = cfg.get("concordance", {})
-TOP_N = int(conc.get("top_n", 50))
+# --------------- Helper: sample list ---------------
+def _strip_suffix(name, sfx):
+    return name[:-len(sfx)] if name.endswith(sfx) else None
 
-# ---- New: rank utilities for summaries ----
-RANKS = {"phylum": 2, "family": 5, "genus": 6, "species": 7}
-RANK_ORDER = ["kingdom","phylum","class","order","family","genus","species"]
+r1_bases = { _strip_suffix(p.name, R1SFX) for p in Path(RAW_DIR).glob(f"*{R1SFX}") }
+r2_bases = { _strip_suffix(p.name, R2SFX) for p in Path(RAW_DIR).glob(f"*{R2SFX}") }
+SAMPLES = sorted({s for s in r1_bases.intersection(r2_bases) if s})
 
-rule all:
-    input:
-        expand("qiime2/qc/fastqc/{s}_R1_fastqc.html", s=SAMPLES),
-        expand("qiime2/qc/fastqc/{s}_R2_fastqc.html", s=SAMPLES),
-        "qiime2/qc/multiqc/multiqc_report.html",
-        "qiime2/demux.qza",
-        "qiime2/demux.qzv",
-        "qiime2/table.qza",
-        "qiime2/rep-seqs.qza",
-        "qiime2/denoise-stats.qza",
-        "qiime2/taxonomy/taxonomy_primary.qza",
-        "qiime2/taxonomy/taxa-barplot_primary.qzv",
-        expand("qiime2/taxonomy/taxonomy_gg2.qza", allow_missing=True),
-        expand(f"qiime2/concordance/top{TOP_N}_concordance.csv", allow_missing=True)
-        
+if len(SAMPLES) == 0:
+    # 明确报错，避免“空跑”
+    raise AssertionError(f"No samples found in {RAW_DIR} matching *{R1SFX} and *{R2SFX}")
 
-# ---------------- QC ----------------
+# --------------- Wildcard constraints ---------------
+# (ASV/OTU 物种层级汇总规则使用)
+wildcard_constraints:
+    rank="phylum|family|genus|species"
+
+# ====================================================
+# QC (FastQC/MultiQC)  —— 可选；若不用可不设为 target
+# ====================================================
 rule fastqc:
     input:
-        r1 = lambda wc: RAW / f"{wc.sample}{R1SFX}",
-        r2 = lambda wc: RAW / f"{wc.sample}{R2SFX}",
+        r1=lambda wc: f"{RAW_DIR}/{wc.sample}{R1SFX}",
+        r2=lambda wc: f"{RAW_DIR}/{wc.sample}{R2SFX}"
     output:
-        html1 = "qiime2/qc/fastqc/{sample}_R1_fastqc.html",
-        html2 = "qiime2/qc/fastqc/{sample}_R2_fastqc.html",
-        zip1  = "qiime2/qc/fastqc/{sample}_R1_fastqc.zip",
-        zip2  = "qiime2/qc/fastqc/{sample}_R2_fastqc.zip",
+        html1=f"qiime2/qc/fastqc/{{sample}}_R1_fastqc.html",
+        html2=f"qiime2/qc/fastqc/{{sample}}_R2_fastqc.html",
+        zip1 =f"qiime2/qc/fastqc/{{sample}}_R1_fastqc.zip",
+        zip2 =f"qiime2/qc/fastqc/{{sample}}_R2_fastqc.zip"
     conda: "workflow/envs/qc.yaml"
     threads: 2
     shell:
@@ -101,10 +102,10 @@ rule fastqc:
 
 rule multiqc:
     input:
-        expand("qiime2/qc/fastqc/{s}_R1_fastqc.zip", s=SAMPLES),
-        expand("qiime2/qc/fastqc/{s}_R2_fastqc.zip", s=SAMPLES),
+        expand("qiime2/qc/fastqc/{sample}_R1_fastqc.zip", sample=SAMPLES),
+        expand("qiime2/qc/fastqc/{sample}_R2_fastqc.zip", sample=SAMPLES)
     output:
-        html = "qiime2/qc/multiqc/multiqc_report.html"
+        html="qiime2/qc/multiqc/multiqc_report.html"
     conda: "workflow/envs/qc.yaml"
     shell:
         r"""
@@ -112,173 +113,113 @@ rule multiqc:
         multiqc -o qiime2/qc/multiqc qiime2/qc/fastqc
         """
 
-# ------------- Cutadapt -------------
+# ====================================================
+# Trim (cutadapt) → Manifest → QIIME Import → DADA2
+# ====================================================
 rule cutadapt_paired:
     input:
-        r1 = lambda wc: RAW / f"{wc.sample}{R1SFX}",
-        r2 = lambda wc: RAW / f"{wc.sample}{R2SFX}",
+        r1=lambda wc: f"{RAW_DIR}/{wc.sample}{R1SFX}",
+        r2=lambda wc: f"{RAW_DIR}/{wc.sample}{R2SFX}"
     output:
-        r1t = "qiime2/trimmed/{sample}_R1.trimmed.fastq.gz",
-        r2t = "qiime2/trimmed/{sample}_R2.trimmed.fastq.gz"
-    params:
-        fwd = prim_fwd,
-        rev = prim_rev,
-        extra = cfg.get("cutadapt_extra","--minimum-length 50 -q 20,20")
+        r1=f"qiime2/trimmed/{{sample}}_R1.trimmed.fastq.gz",
+        r2=f"qiime2/trimmed/{{sample}}_R2.trimmed.fastq.gz"
     conda: "workflow/envs/cutadapt.yaml"
     threads: 2
     shell:
         r"""
         mkdir -p qiime2/trimmed
-        cutadapt -j {threads}           -g {params.fwd} -G {params.rev}           -o {output.r1t} -p {output.r2t}           {params.extra}           {input.r1} {input.r2} > qiime2/trimmed/{wildcards.sample}.cutadapt.log
+        cutadapt -j {threads} \
+          -g {prim_fwd} -G {prim_rev} \
+          -o {output.r1} -p {output.r2} \
+          {CUTADAPT_EXTRA} \
+          {input.r1} {input.r2} > qiime2/trimmed/{wildcards.sample}.cutadapt.log
         """
 
-# ------------- Manifest -------------
 rule make_manifest:
     input:
-        r1s = expand("qiime2/trimmed/{s}_R1.trimmed.fastq.gz", s=SAMPLES),
-        r2s = expand("qiime2/trimmed/{s}_R2.trimmed.fastq.gz", s=SAMPLES),
+        r1=expand("qiime2/trimmed/{sample}_R1.trimmed.fastq.gz", sample=SAMPLES),
+        r2=expand("qiime2/trimmed/{sample}_R2.trimmed.fastq.gz", sample=SAMPLES)
     output:
-        manifest = "qiime2/manifest_pe.tsv"
+        "qiime2/manifest_pe.tsv"
     run:
-        from pathlib import Path
-        man = Path(output.manifest); man.parent.mkdir(parents=True, exist_ok=True)
-        with man.open("w") as fh:
-            fh.write("sample-id\tforward-absolute-filepath\treverse-absolute-filepath\n")
+        Path("qiime2").mkdir(exist_ok=True, parents=True)
+        with open("qiime2/manifest_pe.tsv", "w") as f:
+            print("sample-id\tforward-absolute-filepath\treverse-absolute-filepath", file=f)
             for s in SAMPLES:
-                f = (Path("qiime2/trimmed")/f"{s}_R1.trimmed.fastq.gz").resolve()
-                r = (Path("qiime2/trimmed")/f"{s}_R2.trimmed.fastq.gz").resolve()
-                fh.write(f"{s}\t{f}\t{r}\n")
+                fwd = Path(f"qiime2/trimmed/{s}_R1.trimmed.fastq.gz").resolve()
+                rev = Path(f"qiime2/trimmed/{s}_R2.trimmed.fastq.gz").resolve()
+                print(f"{s}\t{fwd}\t{rev}", file=f)
 
-# ------------- QIIME 2 core pipeline -------------
 rule qiime_import:
     input: "qiime2/manifest_pe.tsv"
     output: "qiime2/demux.qza"
-    conda: "workflow/envs/qiime2.yaml" if not USE_EXISTING_QIIME else None
     shell:
         r"""
-        {Q2} tools import --type 'SampleData[PairedEndSequencesWithQuality]' --input-format PairedEndFastqManifestPhred33V2 --input-path {input} --output-path {output}
+        {Q2} tools import \
+          --type 'SampleData[PairedEndSequencesWithQuality]' \
+          --input-format PairedEndFastqManifestPhred33V2 \
+          --input-path {input} \
+          --output-path {output}
         """
 
 rule demux_summarize:
     input: "qiime2/demux.qza"
     output: "qiime2/demux.qzv"
-    conda: "workflow/envs/qiime2.yaml" if not USE_EXISTING_QIIME else None
     shell:
         r"""
         {Q2} demux summarize --i-data {input} --o-visualization {output}
         """
 
 rule dada2_denoise_paired:
-    input: demux="qiime2/demux.qza"
+    input: "qiime2/demux.qza"
     output:
         table="qiime2/table.qza",
         reps ="qiime2/rep-seqs.qza",
         stats="qiime2/denoise-stats.qza"
-    params:
-        tlf = cfg["dada2"].get("trim_left_f", 0),
-        tlr = cfg["dada2"].get("trim_left_r", 0),
-        trf = cfg["dada2"].get("trunc_len_f", 0),
-        trr = cfg["dada2"].get("trunc_len_r", 0)
-    conda: "workflow/envs/qiime2.yaml" if not USE_EXISTING_QIIME else None
     threads: 8
     shell:
         r"""
         {Q2} dada2 denoise-paired \
-          --i-demultiplexed-seqs {input.demux} \
-          --p-trim-left-f {params.tlf} --p-trim-left-r {params.tlr} \
-          --p-trunc-len-f {params.trf} --p-trunc-len-r {params.trr} \
+          --i-demultiplexed-seqs {input} \
+          --p-trim-left-f {TRIM_LEFT_F} --p-trim-left-r {TRIM_LEFT_R} \
+          --p-trunc-len-f {TRUNC_LEN_F} --p-trunc-len-r {TRUNC_LEN_R} \
           --o-table {output.table} \
           --o-representative-sequences {output.reps} \
           --o-denoising-stats {output.stats} \
           --p-n-threads {threads}
         """
 
-# ------------- Classifier build (SILVA) -------------
-rule build_classifier_silva:
-    output:
-        classifier = str(SILVA_CLASSIFIER),
-        uniq_seqs  = str(SILVA_UNIQ_SEQS),
-        uniq_tax   = str(SILVA_UNIQ_TAX)
-    params:
-        region = region_label,
-        ver = silva_version,
-        target = silva_target,
-        fwd = prim_fwd,
-        rev = prim_rev,
-        symb = symbiont_list
-    conda: "workflow/envs/qiime2.yaml" if not USE_EXISTING_QIIME else None
-    shell:
-        r"""
-        TARGET="{params.target}" \
-        bash refs/get_silva_classifier.sh {params.region} '{params.fwd}' '{params.rev}' {params.ver} {params.symb}
-        """
-
-# ------------- Classifier build (GG2, 2024.09; optional) -------------
-rule build_classifier_gg2:
-    input:
-        seqs = GG2_SEQS,
-        tax  = GG2_TAX
-    output:
-        classifier = str(GG2_CLASSIFIER)
-    params:
-        region = region_label,
-        outdir = str(GG2_DIR),
-        fwd = prim_fwd,
-        rev = prim_rev
-    conda: "workflow/envs/qiime2.yaml" if not USE_EXISTING_QIIME else None
-    shell:
-        r"""
-        set -euo pipefail
-        mkdir -p "{params.outdir}"
-
-        # 1) extract V3–V4 reads from GG2 full-length backbone
-        {Q2} feature-classifier extract-reads \
-          --i-sequences "{input.seqs}" \
-          --p-f-primer '{params.fwd}' \
-          --p-r-primer '{params.rev}' \
-          --o-reads "{params.outdir}/reads.qza"
-
-        # 2) RESCRIPt dereplicate (auto-pick taxonomy flag name)
-        DEREP_FLAG="--o-dereplicated-taxa"
-        {Q2} rescript dereplicate --help | grep -q -- "--o-dereplicated-taxonomy" && DEREP_FLAG="--o-dereplicated-taxonomy"
-
-        {Q2} rescript dereplicate \
-          --i-sequences "{params.outdir}/reads.qza" \
-          --i-taxa      "{input.tax}" \
-          --p-mode uniq \
-          --o-dereplicated-sequences "{params.outdir}/uniq-seqs.qza" \
-          $DEREP_FLAG                     "{params.outdir}/uniq-tax.qza"
-
-        # 3) train Naive Bayes classifier
-        {Q2} feature-classifier fit-classifier-naive-bayes \
-          --i-reference-reads    "{params.outdir}/uniq-seqs.qza" \
-          --i-reference-taxonomy "{params.outdir}/uniq-tax.qza" \
-          --o-classifier         "{output.classifier}"
-        """
-
-# ------------- Taxonomy (Primary) -------------
+# ====================================================
+# Taxonomy (Primary SILVA) + Barplot
+# ====================================================
 rule taxonomy_primary:
     input:
         reps="qiime2/rep-seqs.qza",
-        classifier=str(primary_classifier),
+        classifier=str(PRIMARY_CLASSIFIER),
         meta=str(META)
     output:
         tax="qiime2/taxonomy/taxonomy_primary.qza",
         bar="qiime2/taxonomy/taxa-barplot_primary.qzv"
-    conda: "workflow/envs/qiime2.yaml" if not USE_EXISTING_QIIME else None
     shell:
         r"""
         mkdir -p qiime2/taxonomy
-        {Q2} feature-classifier classify-sklearn --i-classifier {input.classifier} --i-reads {input.reps} --o-classification {output.tax}
-        {Q2} taxa barplot --i-table qiime2/table.qza --i-taxonomy {output.tax} --m-metadata-file "{input.meta}" --o-visualization {output.bar}
+        {Q2} feature-classifier classify-sklearn \
+          --i-classifier {input.classifier} \
+          --i-reads {input.reps} \
+          --o-classification {output.tax}
+        {Q2} taxa barplot \
+          --i-table qiime2/table.qza \
+          --i-taxonomy {output.tax} \
+          --m-metadata-file "{input.meta}" \
+          --o-visualization {output.bar}
         """
 
-# ------------- Taxonomy (GG2 cross-check, optional) -------------
-use_gg2 = bool(GG2_SEQS) and bool(GG2_TAX)
+# ----------------------------------------------------
+# TSV Exports (always available; 在 if use_gg2 外面)
+# ----------------------------------------------------
 rule export_taxonomy_primary_tsv:
     input: "qiime2/taxonomy/taxonomy_primary.qza"
     output: tsv="qiime2/taxonomy/taxonomy_primary.tsv"
-    conda: "workflow/envs/qiime2.yaml" if not USE_EXISTING_QIIME else None
     shell:
         r"""
         rm -rf qiime2/taxonomy/_export_primary || true
@@ -286,38 +227,166 @@ rule export_taxonomy_primary_tsv:
         mv qiime2/taxonomy/_export_primary/taxonomy.tsv {output.tsv}
         rm -rf qiime2/taxonomy/_export_primary
         """
-			
+
 rule export_table_tsv:
     input: "qiime2/table.qza"
     output:
         biom="qiime2/_tmp/feature-table.biom",
         tsv ="qiime2/feature-table.tsv"
-    conda: None
     shell:
         r"""
         rm -rf qiime2/_tmp || true; mkdir -p qiime2/_tmp
         {Q2} tools export --input-path {input} --output-path qiime2/_tmp
         conda run -n {QIIME_ENV_NAME} biom convert -i {output.biom} -o {output.tsv} --to-tsv
-        """	    	
-		
+        """
+
+# ====================================================
+# ASV → 宽表 +（相对丰度、长表）
+# ====================================================
+rule asv_level_table:
+    input:
+        table_qza="qiime2/table.qza",
+        tax_qza="qiime2/taxonomy/taxonomy_primary.qza"
+    output:
+        tsv = "qiime2/summary/asv_{rank}.tsv"
+    params:
+        rank=lambda wc: wc.rank
+    shell:
+        r"""
+        set -euo pipefail
+        TMP=qiime2/summary/_tmp_asv_{wildcards.rank}
+        mkdir -p "$TMP/tab" "$TMP/tax"
+        {Q2} tools export --input-path {input.table_qza} --output-path "$TMP/tab"
+        conda run -n {QIIME_ENV_NAME} biom convert -i "$TMP/tab/feature-table.biom" -o "$TMP/feature-table.tsv" --to-tsv
+        {Q2} tools export --input-path {input.tax_qza} --output-path "$TMP/tax"
+
+        conda run -n {QIIME_ENV_NAME} python workflow/scripts/rank_wide.py \
+          --table-tsv "$TMP/feature-table.tsv" \
+          --tax-tsv   "$TMP/tax/taxonomy.tsv" \
+          --rank {params.rank} \
+          --output {output.tsv}
+        """
+
+rule asv_post_rank:
+    input:
+        wide = "qiime2/summary/asv_{rank}.tsv",
+        meta = str(META)
+    output:
+        rel  = "qiime2/summary/asv_{rank}.relabund.tsv",
+        long = "qiime2/summary/asv_{rank}.long.tsv"
+    params:
+        group = GROUP_COL
+    shell:
+        r"""
+        conda run -n {QIIME_ENV_NAME} python workflow/scripts/wide_post.py \
+          --wide-tsv {input.wide} \
+          --metadata {input.meta} \
+          --group-col {params.group} \
+          --out-rel  {output.rel} \
+          --out-long {output.long}
+        """
+
+# ====================================================
+# OTU97（de novo, vsearch）→ Primary SILVA 分类 + 宽表/长表
+# ====================================================
+rule otu97_cluster_denovo:
+    input:
+        table="qiime2/table.qza",
+        reps ="qiime2/rep-seqs.qza"
+    output:
+        table="qiime2/otu97/otu97-table.qza",
+        reps ="qiime2/otu97/otu97-rep-seqs.qza"
+    shell:
+        r"""
+        mkdir -p qiime2/otu97
+        {Q2} vsearch cluster-features-de-novo \
+          --i-table {input.table} \
+          --i-sequences {input.reps} \
+          --p-perc-identity 0.97 \
+          --o-clustered-table {output.table} \
+          --o-clustered-sequences {output.reps}
+        """
+
+rule otu97_taxonomy_primary:
+    input:
+        reps="qiime2/otu97/otu97-rep-seqs.qza",
+        classifier=str(PRIMARY_CLASSIFIER)
+    output:
+        tax="qiime2/otu97/taxonomy_otu97_primary.qza"
+    shell:
+        r"""
+        {Q2} feature-classifier classify-sklearn \
+          --i-classifier {input.classifier} \
+          --i-reads {input.reps} \
+          --o-classification {output.tax}
+        """
+
+rule otu97_primary_level_table:
+    input:
+        table_qza="qiime2/otu97/otu97-table.qza",
+        tax_qza  ="qiime2/otu97/taxonomy_otu97_primary.qza"
+    output:
+        tsv="qiime2/summary/otu97_{rank}.tsv"
+    params:
+        rank=lambda wc: wc.rank
+    shell:
+        r"""
+        set -euo pipefail
+        TMP=qiime2/summary/_tmp_otu97_{wildcards.rank}
+        mkdir -p "$TMP/tab" "$TMP/tax"
+        {Q2} tools export --input-path {input.table_qza} --output-path "$TMP/tab"
+        conda run -n {QIIME_ENV_NAME} biom convert -i "$TMP/tab/feature-table.biom" -o "$TMP/otu-table.tsv" --to-tsv
+        {Q2} tools export --input-path {input.tax_qza} --output-path "$TMP/tax"
+
+        conda run -n {QIIME_ENV_NAME} python workflow/scripts/rank_wide.py \
+          --table-tsv "$TMP/otu-table.tsv" \
+          --tax-tsv   "$TMP/tax/taxonomy.tsv" \
+          --rank {params.rank} \
+          --output {output.tsv}
+        """
+
+rule otu97_primary_post_rank:
+    input:
+        wide = "qiime2/summary/otu97_{rank}.tsv",
+        meta = str(META)
+    output:
+        rel  = "qiime2/summary/otu97_{rank}.relabund.tsv",
+        long = "qiime2/summary/otu97_{rank}.long.tsv"
+    params:
+        group = GROUP_COL
+    shell:
+        r"""
+        conda run -n {QIIME_ENV_NAME} python workflow/scripts/wide_post.py \
+          --wide-tsv {input.wide} \
+          --metadata {input.meta} \
+          --group-col {params.group} \
+          --out-rel  {output.rel} \
+          --out-long {output.long}
+        """
+
+# ====================================================
+# GG2 Cross-check（ASV/OTU97 with GG2 taxonomy）—— 可选
+# ====================================================
 if use_gg2:
+
     rule taxonomy_gg2:
         input:
             reps="qiime2/rep-seqs.qza",
-            classifier=str(GG2_CLASSIFIER)
+            classifier=str(GG2_DIR / "V3V4-uniq-classifier.qza")
         output:
             tax="qiime2/taxonomy/taxonomy_gg2.qza"
-        conda: "workflow/envs/qiime2.yaml" if not USE_EXISTING_QIIME else None
         shell:
             r"""
             mkdir -p qiime2/taxonomy
-            {Q2} feature-classifier classify-sklearn --i-classifier {input.classifier} --i-reads {input.reps} --o-classification {output.tax}
+            {Q2} feature-classifier classify-sklearn \
+              --i-classifier {input.classifier} \
+              --i-reads {input.reps} \
+              --o-classification {output.tax}
             """
-   
+
     rule export_taxonomy_gg2_tsv:
         input: "qiime2/taxonomy/taxonomy_gg2.qza"
         output: tsv="qiime2/taxonomy/taxonomy_gg2.tsv"
-        conda: "workflow/envs/qiime2.yaml" if not USE_EXISTING_QIIME else None
         shell:
             r"""
             rm -rf qiime2/taxonomy/_export_gg2 || true
@@ -326,25 +395,22 @@ if use_gg2:
             rm -rf qiime2/taxonomy/_export_gg2
             """
 
-    # --- ASV (GG2 taxonomy) → 宽表 ---
+    # ---- ASV with GG2 taxonomy → 宽表/后处理 ----
     rule asv_level_table_gg2:
         input:
             table_qza="qiime2/table.qza",
-            tax_qza="qiime2/taxonomy/taxonomy_gg2.qza"
+            tax_qza  ="qiime2/taxonomy/taxonomy_gg2.qza"
         output:
-            tsv = "qiime2/summary/asv_gg2_{rank,phylum|family|genus|species}.tsv"
+            tsv = "qiime2/summary/asv_gg2_{rank}.tsv"
         params:
-            rank = lambda wc: wc.rank  # phylum/family/genus/species
-        conda: None
+            rank=lambda wc: wc.rank
         shell:
             r"""
             set -euo pipefail
             TMP=qiime2/summary/_tmp_asv_gg2_{wildcards.rank}
             mkdir -p "$TMP/tab" "$TMP/tax"
             {Q2} tools export --input-path {input.table_qza} --output-path "$TMP/tab"
-            conda run -n {QIIME_ENV_NAME} biom convert \
-              -i "$TMP/tab/feature-table.biom" \
-              -o "$TMP/feature-table.tsv" --to-tsv
+            conda run -n {QIIME_ENV_NAME} biom convert -i "$TMP/tab/feature-table.biom" -o "$TMP/feature-table.tsv" --to-tsv
             {Q2} tools export --input-path {input.tax_qza} --output-path "$TMP/tax"
 
             conda run -n {QIIME_ENV_NAME} python workflow/scripts/rank_wide.py \
@@ -354,7 +420,6 @@ if use_gg2:
               --output {output.tsv}
             """
 
-    # --- ASV (GG2) → 相对丰度 + 长表 ---
     rule asv_gg2_post_rank:
         input:
             wide = "qiime2/summary/asv_gg2_{rank}.tsv",
@@ -363,8 +428,7 @@ if use_gg2:
             rel  = "qiime2/summary/asv_gg2_{rank}.relabund.tsv",
             long = "qiime2/summary/asv_gg2_{rank}.long.tsv"
         params:
-            group = cfg.get("summary", {}).get("group_column", "group")
-        conda: None
+            group = GROUP_COL
         shell:
             r"""
             conda run -n {QIIME_ENV_NAME} python workflow/scripts/wide_post.py \
@@ -374,15 +438,57 @@ if use_gg2:
               --out-rel  {output.rel} \
               --out-long {output.long}
             """
-            
-    # OTU97 代表序列用 GG2 分类
-    rule otu97_taxonomy_gg2:
+
+    # ---- OTU97 using GG2 reference (closed/open) ----
+    # closed-reference
+    rule otu97gg2_cluster_closed:
         input:
-            reps="qiime2/otu97/otu97-rep-seqs.qza",
-            classifier=str(GG2_CLASSIFIER)   # 已在前面定义
+            table="qiime2/table.qza",
+            reps ="qiime2/rep-seqs.qza",
+            ref  = GG2_REF_SEQS
         output:
-            tax="qiime2/otu97/taxonomy_otu97_gg2.qza"
-        conda: "workflow/envs/qiime2.yaml" if not USE_EXISTING_QIIME else None
+            table="qiime2/otu97gg2/closed-table.qza",
+            reps ="qiime2/otu97gg2/closed-rep-seqs.qza"
+        shell:
+            r"""
+            mkdir -p qiime2/otu97gg2
+            {Q2} vsearch cluster-features-closed-reference \
+              --i-table {input.table} \
+              --i-sequences {input.reps} \
+              --i-reference-sequences {input.ref} \
+              --p-perc-identity 0.97 \
+              --o-clustered-table {output.table} \
+              --o-clustered-sequences {output.reps}
+            """
+
+    # open-reference
+    rule otu97gg2_cluster_open:
+        input:
+            table="qiime2/table.qza",
+            reps ="qiime2/rep-seqs.qza",
+            ref  = GG2_REF_SEQS
+        output:
+            table="qiime2/otu97gg2/open-table.qza",
+            reps ="qiime2/otu97gg2/open-rep-seqs.qza"
+        shell:
+            r"""
+            mkdir -p qiime2/otu97gg2
+            {Q2} vsearch cluster-features-open-reference \
+              --i-table {input.table} \
+              --i-sequences {input.reps} \
+              --i-reference-sequences {input.ref} \
+              --p-perc-identity 0.97 \
+              --o-clustered-table {output.table} \
+              --o-clustered-sequences {output.reps}
+            """
+
+    # GG2 taxonomy on closed/open OTU reps
+    rule otu97gg2_taxonomy_closed:
+        input:
+            reps="qiime2/otu97gg2/closed-rep-seqs.qza",
+            classifier=str(GG2_DIR / "V3V4-uniq-classifier.qza")
+        output:
+            tax="qiime2/otu97gg2/taxonomy_closed_gg2.qza"
         shell:
             r"""
             {Q2} feature-classifier classify-sklearn \
@@ -391,25 +497,36 @@ if use_gg2:
               --o-classification {output.tax}
             """
 
-    # OTU97 (GG2) → 宽表
-    rule otu97_gg2_level_table:
+    rule otu97gg2_taxonomy_open:
         input:
-            table_qza="qiime2/otu97/otu97-table.qza",
-            tax_qza  ="qiime2/otu97/taxonomy_otu97_gg2.qza"
+            reps="qiime2/otu97gg2/open-rep-seqs.qza",
+            classifier=str(GG2_DIR / "V3V4-uniq-classifier.qza")
         output:
-            tsv="qiime2/summary/otu97_gg2_{rank,phylum|family|genus|species}.tsv"
+            tax="qiime2/otu97gg2/taxonomy_open_gg2.qza"
+        shell:
+            r"""
+            {Q2} feature-classifier classify-sklearn \
+              --i-classifier {input.classifier} \
+              --i-reads {input.reps} \
+              --o-classification {output.tax}
+            """
+
+    # OTU97 (GG2) → 宽表/后处理
+    rule otu97_gg2_level_table_closed:
+        input:
+            table_qza="qiime2/otu97gg2/closed-table.qza",
+            tax_qza  ="qiime2/otu97gg2/taxonomy_closed_gg2.qza"
+        output:
+            tsv="qiime2/summary/otu97_gg2_closed_{rank}.tsv"
         params:
             rank=lambda wc: wc.rank
-        conda: None
         shell:
             r"""
             set -euo pipefail
-            TMP=qiime2/summary/_tmp_otu97_gg2_{wildcards.rank}
+            TMP=qiime2/summary/_tmp_otu97_gg2_closed_{wildcards.rank}
             mkdir -p "$TMP/tab" "$TMP/tax"
             {Q2} tools export --input-path {input.table_qza} --output-path "$TMP/tab"
-            conda run -n {QIIME_ENV_NAME} biom convert \
-              -i "$TMP/tab/feature-table.biom" \
-              -o "$TMP/otu-table.tsv" --to-tsv
+            conda run -n {QIIME_ENV_NAME} biom convert -i "$TMP/tab/feature-table.biom" -o "$TMP/otu-table.tsv" --to-tsv
             {Q2} tools export --input-path {input.tax_qza} --output-path "$TMP/tax"
 
             conda run -n {QIIME_ENV_NAME} python workflow/scripts/rank_wide.py \
@@ -419,102 +536,39 @@ if use_gg2:
               --output {output.tsv}
             """
 
-    # OTU97 (GG2) → 相对丰度 + 长表
-    rule otu97_gg2_post_rank:
+    rule otu97_gg2_level_table_open:
         input:
-            wide = "qiime2/summary/otu97_gg2_{rank}.tsv",
-            meta = str(META)
+            table_qza="qiime2/otu97gg2/open-table.qza",
+            tax_qza  ="qiime2/otu97gg2/taxonomy_open_gg2.qza"
         output:
-            rel  = "qiime2/summary/otu97_gg2_{rank}.relabund.tsv",
-            long = "qiime2/summary/otu97_gg2_{rank}.long.tsv"
+            tsv="qiime2/summary/otu97_gg2_open_{rank}.tsv"
         params:
-            group = cfg.get("summary", {}).get("group_column", "group")
-        conda: None
-        shell:
-            r"""
-            conda run -n {QIIME_ENV_NAME} python workflow/scripts/wide_post.py \
-              --wide-tsv {input.wide} \
-              --metadata {input.meta} \
-              --group-col {params.group} \
-              --out-rel  {output.rel} \
-              --out-long {output.long}
-            """
- 
-    # 1) 并列注释清单 + 各阶元一致性统计
-    rule pair_taxonomy_tables:
-        input:
-            silva="qiime2/taxonomy/taxonomy_primary.tsv",
-            gg2  ="qiime2/taxonomy/taxonomy_gg2.tsv"
-        output:
-            pairs ="qiime2/concordance/pair_taxonomy.tsv",
-            agree ="qiime2/concordance/agreement_by_rank.tsv"
-        conda: None
-        shell:
-            r"""
-            conda run -n {QIIME_ENV_NAME} python workflow/scripts/pair_tax.py \
-              --silva {input.silva} \
-              --gg2   {input.gg2} \
-              --out-pairs {output.pairs} \
-              --out-agree {output.agree}
-            """
-
-    # 2) （可选）按“最深一致阶元”产生 resolved 注释（QIIME TSV 格式）
-    rule resolved_taxonomy_tsv:
-        input:
-            silva="qiime2/taxonomy/taxonomy_primary.tsv",
-            gg2  ="qiime2/taxonomy/taxonomy_gg2.tsv"
-        output:
-            tsv="qiime2/taxonomy/taxonomy_resolved.tsv"
-        conda: None
-        shell:
-            r"""
-            conda run -n {QIIME_ENV_NAME} python workflow/scripts/resolve_tax.py \
-              --silva {input.silva} \
-              --gg2   {input.gg2} \
-              --out   {output.tsv}
-            """
-
-    # 3) 用 resolved 注释生成各阶元宽表（复用 rank_wide.py；从 TSV 直接读注释）
-    wildcard_constraints:
-        rrank="phylum|family|genus|species"
-
-    rule asv_level_table_resolved:
-        input:
-            table_qza="qiime2/table.qza",
-            tax_tsv  ="qiime2/taxonomy/taxonomy_resolved.tsv"
-        output:
-            tsv="qiime2/summary/asv_resolved_{rrank}.tsv"
-        params:
-            rrank=lambda wc: wc.rrank
-        conda: None
+            rank=lambda wc: wc.rank
         shell:
             r"""
             set -euo pipefail
-            TMP=qiime2/summary/_tmp_asv_resolved_{wildcards.rrank}
-            mkdir -p "$TMP/tab"
+            TMP=qiime2/summary/_tmp_otu97_gg2_open_{wildcards.rank}
+            mkdir -p "$TMP/tab" "$TMP/tax"
             {Q2} tools export --input-path {input.table_qza} --output-path "$TMP/tab"
-            conda run -n {QIIME_ENV_NAME} biom convert \
-              -i "$TMP/tab/feature-table.biom" \
-              -o "$TMP/feature-table.tsv" --to-tsv
+            conda run -n {QIIME_ENV_NAME} biom convert -i "$TMP/tab/feature-table.biom" -o "$TMP/otu-table.tsv" --to-tsv
+            {Q2} tools export --input-path {input.tax_qza} --output-path "$TMP/tax"
 
             conda run -n {QIIME_ENV_NAME} python workflow/scripts/rank_wide.py \
-              --table-tsv "$TMP/feature-table.tsv" \
-              --tax-tsv   {input.tax_tsv} \
-              --rank      {params.rrank} \
-              --output    {output.tsv}
+              --table-tsv "$TMP/otu-table.tsv" \
+              --tax-tsv   "$TMP/tax/taxonomy.tsv" \
+              --rank {params.rank} \
+              --output {output.tsv}
             """
 
-    # （可选）resolved 的相对丰度/长表
-    rule asv_resolved_post_rank:
+    rule otu97_gg2_post_rank_closed:
         input:
-            wide = "qiime2/summary/asv_resolved_{rrank}.tsv",
+            wide = "qiime2/summary/otu97_gg2_closed_{rank}.tsv",
             meta = str(META)
         output:
-            rel  = "qiime2/summary/asv_resolved_{rrank}.relabund.tsv",
-            long = "qiime2/summary/asv_resolved_{rrank}.long.tsv"
+            rel  = "qiime2/summary/otu97_gg2_closed_{rank}.relabund.tsv",
+            long = "qiime2/summary/otu97_gg2_closed_{rank}.long.tsv"
         params:
-            group = cfg.get("summary", {}).get("group_column", "group")
-        conda: None
+            group = GROUP_COL
         shell:
             r"""
             conda run -n {QIIME_ENV_NAME} python workflow/scripts/wide_post.py \
@@ -524,323 +578,146 @@ if use_gg2:
               --out-rel  {output.rel} \
               --out-long {output.long}
             """
- 
+
+    rule otu97_gg2_post_rank_open:
+        input:
+            wide = "qiime2/summary/otu97_gg2_open_{rank}.tsv",
+            meta = str(META)
+        output:
+            rel  = "qiime2/summary/otu97_gg2_open_{rank}.relabund.tsv",
+            long = "qiime2/summary/otu97_gg2_open_{rank}.long.tsv"
+        params:
+            group = GROUP_COL
+        shell:
+            r"""
+            conda run -n {QIIME_ENV_NAME} python workflow/scripts/wide_post.py \
+              --wide-tsv {input.wide} \
+              --metadata {input.meta} \
+              --group-col {params.group} \
+              --out-rel  {output.rel} \
+              --out-long {output.long}
+            """
+
+    # Concordance top-N（依赖两份 taxonomy TSV）
     rule concordance_top:
         input:
             table_tsv="qiime2/feature-table.tsv",
             silva_tsv="qiime2/taxonomy/taxonomy_primary.tsv",
-            gg2_tsv="qiime2/taxonomy/taxonomy_gg2.tsv"
+            gg2_tsv  ="qiime2/taxonomy/taxonomy_gg2.tsv"
         output:
             csv=f"qiime2/concordance/top{TOP_N}_concordance.csv"
         conda: "workflow/envs/qc.yaml"
         script:
             "workflow/scripts/concordance.py"
 
-# ---------------- 97% OTU (de novo clustering) ----------------
-rule otu97_denovo:
-    input:
-        table="qiime2/table.qza",
-        reps ="qiime2/rep-seqs.qza"
-    output:
-        t="qiime2/otu97/otu97-table.qza",
-        r="qiime2/otu97/otu97-rep-seqs.qza"
-    threads: 8
-    conda: "workflow/envs/qiime2.yaml" if not USE_EXISTING_QIIME else None
-    shell:
-        r"""
-        mkdir -p qiime2/otu97
-        {Q2} vsearch cluster-features-de-novo \
-          --i-table {input.table} \
-          --i-sequences {input.reps} \
-          --p-perc-identity 0.97 \
-          --o-clustered-table {output.t} \
-          --o-clustered-sequences {output.r}
-        """
+    # （可选）SEPP insertion tree with GG2 non-V4 backbone
+    if GG2_SEPP_REF:
+        rule gg2_nonv4_sepp_insertion:
+            input:
+                reps="qiime2/rep-seqs.qza",
+                ref =GG2_SEPP_REF
+            output:
+                tree="qiime2/trees/gg2_nonv4_sepp/insertion-tree.qza",
+                place="qiime2/trees/gg2_nonv4_sepp/placements.qza"
+            shell:
+                r"""
+                mkdir -p qiime2/trees/gg2_nonv4_sepp
+                {Q2} fragment-insertion sepp \
+                  --i-representative-sequences {input.reps} \
+                  --i-reference-database {input.ref} \
+                  --o-tree {output.tree} \
+                  --o-placements {output.place}
+                """
 
-# === OTU97 against GG2 (closed-reference) ===
-rule otu97_gg2_closed:
-    input:
-        table="qiime2/table.qza",
-        reps ="qiime2/rep-seqs.qza",
-        ref  ="refs/GG2-V3V4/V3V4-uniq-seqs.qza"
-    output:
-        table="qiime2/otu97_gg2_closed/otu97-table.qza",
-        reps ="qiime2/otu97_gg2_closed/otu97-rep-seqs.qza",
-        unmatched="qiime2/otu97_gg2_closed/unmatched.qza"
-    conda: "workflow/envs/qiime2.yaml" if not USE_EXISTING_QIIME else None
-    shell:
-        r"""
-        mkdir -p qiime2/otu97_gg2_closed
-        {Q2} vsearch cluster-features-closed-reference \
-          --i-table {input.table} \
-          --i-sequences {input.reps} \
-          --i-reference-sequences {input.ref} \
-          --p-perc-identity 0.97 \
-          --o-clustered-table {output.table} \
-          --o-clustered-sequences {output.reps} \
-          --o-unmatched-sequences {output.unmatched}
-        """
+        rule export_newick_gg2_sepp:
+            input: "qiime2/trees/gg2_nonv4_sepp/insertion-tree.qza"
+            output: "qiime2/trees/gg2_nonv4_sepp/tree.nwk"
+            shell:
+                r"""
+                rm -rf qiime2/trees/gg2_nonv4_sepp/_exp || true
+                {Q2} tools export --input-path {input} --output-path qiime2/trees/gg2_nonv4_sepp/_exp
+                mv qiime2/trees/gg2_nonv4_sepp/_exp/tree.nwk {output}
+                rm -rf qiime2/trees/gg2_nonv4_sepp/_exp
+                """
 
-# 分类（GG2分类器）——给 closed-ref OTU 的代表序列注释
-rule otu97_gg2_closed_taxonomy:
-    input:
-        reps="qiime2/otu97_gg2_closed/otu97-rep-seqs.qza",
-        classifier=str(GG2_CLASSIFIER)
+# ====================================================
+# (可选) 构建分类器（SILVA / GG2）
+# ====================================================
+# —— SILVA —— 与你现有的 refs/get_silva_classifier.sh 配合
+rule build_classifier_silva:
     output:
-        tax="qiime2/otu97_gg2_closed/taxonomy_otu97_gg2.qza"
-    conda: "workflow/envs/qiime2.yaml" if not USE_EXISTING_QIIME else None
-    shell:
-        r"""
-        {Q2} feature-classifier classify-sklearn \
-          --i-classifier {input.classifier} \
-          --i-reads {input.reps} \
-          --o-classification {output.tax}
-        """
-
-# 导出 OTU97(closed) 宽表（按门/科/属/种），沿用 rank_wide.py
-rule otu97_gg2_closed_level_table:
-    input:
-        table_qza="qiime2/otu97_gg2_closed/otu97-table.qza",
-        tax_qza  ="qiime2/otu97_gg2_closed/taxonomy_otu97_gg2.qza"
-    output:
-        tsv="qiime2/summary/otu97_gg2_closed_{rank}.tsv"
+        classifier=f"refs/{region_label}-silva-{silva_version}/silva-{silva_version}-{region_label}-uniq-classifier.qza",
+        uniq_seqs =f"refs/{region_label}-silva-{silva_version}/silva-{silva_version}-{region_label}-uniq-seqs.qza",
+        uniq_tax  =f"refs/{region_label}-silva-{silva_version}/silva-{silva_version}-{region_label}-uniq-tax.qza"
     params:
-        rank=lambda wc: wc.rank  # phylum/family/genus/species
-    conda: None
+        region=region_label, ver=silva_version, target=silva_target,
+        fwd=prim_fwd, rev=prim_rev, symb=symbiont_list
+    shell:
+        r"""
+        TARGET="{params.target}" \
+        bash refs/get_silva_classifier.sh {params.region} '{params.fwd}' '{params.rev}' {params.ver} {params.symb}
+        """
+
+# —— GG2 —— 你此前已提供 refs/GG2-raw/*.qza 并在外部脚本构建
+rule build_classifier_gg2:
+    input:
+        seqs = GG2_SEQS,
+        tax  = GG2_TAX
+    output:
+        classifier=str(GG2_DIR / "V3V4-uniq-classifier.qza")
+    params:
+        region=region_label, outdir=str(GG2_DIR), fwd=prim_fwd, rev=prim_rev
     shell:
         r"""
         set -euo pipefail
-        TMP=qiime2/summary/_tmp_otu97_gg2_closed_{wildcards.rank}
-        mkdir -p "$TMP/tab" "$TMP/tax"
-        {Q2} tools export --input-path {input.table_qza} --output-path "$TMP/tab"
-        conda run -n {QIIME_ENV_NAME} biom convert \
-          -i "$TMP/tab/feature-table.biom" \
-          -o "$TMP/otu-table.tsv" --to-tsv
-        {Q2} tools export --input-path {input.tax_qza} --output-path "$TMP/tax"
-        conda run -n {QIIME_ENV_NAME} python workflow/scripts/rank_wide.py \
-          --table-tsv "$TMP/otu-table.tsv" \
-          --tax-tsv   "$TMP/tax/taxonomy.tsv" \
-          --rank {params.rank} \
-          --output {output.tsv}
+        mkdir -p "{params.outdir}"
+        QIIME="{Q2}"
+
+        $QIIME feature-classifier extract-reads \
+          --i-sequences "{input.seqs}" \
+          --p-f-primer '{params.fwd}' \
+          --p-r-primer '{params.rev}' \
+          --o-reads "{params.outdir}/reads.qza"
+
+        # dereplicate
+        DEREP_FLAG="--o-dereplicated-taxa"
+        $QIIME rescript dereplicate --help | grep -q -- "--o-dereplicated-taxonomy" && DEREP_FLAG="--o-dereplicated-taxonomy"
+
+        $QIIME rescript dereplicate \
+          --i-sequences "{params.outdir}/reads.qza" \
+          --i-taxa      "{input.tax}" \
+          --p-mode uniq \
+          --o-dereplicated-sequences "{params.outdir}/V3V4-uniq-seqs.qza" \
+          $DEREP_FLAG                       "{params.outdir}/V3V4-uniq-tax.qza"
+
+        $QIIME feature-classifier fit-classifier-naive-bayes \
+          --i-reference-reads    "{params.outdir}/V3V4-uniq-seqs.qza" \
+          --i-reference-taxonomy "{params.outdir}/V3V4-uniq-tax.qza" \
+          --o-classifier         "{output.classifier}"
         """
 
-# === OTU97 against GG2 (open-reference，可选) ===
-rule otu97_gg2_open:
+# ====================================================
+# Convenience: rule all (optional)
+# ====================================================
+rule all:
     input:
-        table="qiime2/table.qza",
-        reps ="qiime2/rep-seqs.qza",
-        ref  ="refs/GG2-V3V4/V3V4-uniq-seqs.qza"
-    output:
-        table="qiime2/otu97_gg2_open/otu97-table.qza",
-        reps ="qiime2/otu97_gg2_open/otu97-rep-seqs.qza",
-        newref="qiime2/otu97_gg2_open/new-ref-seqs.qza"
-    conda: "workflow/envs/qiime2.yaml" if not USE_EXISTING_QIIME else None
-    shell:
-        r"""
-        mkdir -p qiime2/otu97_gg2_open
-        {Q2} vsearch cluster-features-open-reference \
-          --i-table {input.table} \
-          --i-sequences {input.reps} \
-          --i-reference-sequences {input.ref} \
-          --p-perc-identity 0.97 \
-          --o-clustered-table {output.table} \
-          --o-clustered-sequences {output.reps} \
-          --o-new-reference-sequences {output.newref}
-        """
+        # 基本核心产物
+        "qiime2/table.qza",
+        "qiime2/rep-seqs.qza",
+        "qiime2/demux.qzv",
+        "qiime2/taxonomy/taxonomy_primary.qza",
+        "qiime2/taxonomy/taxa-barplot_primary.qzv",
+        # ASV 宽表
+        expand("qiime2/summary/asv_{rank}.tsv", rank=["phylum","family","genus","species"]),
+        # ASV 后处理
+        expand("qiime2/summary/asv_{rank}.relabund.tsv", rank=["phylum","family","genus","species"]),
+        expand("qiime2/summary/asv_{rank}.long.tsv",     rank=["phylum","family","genus","species"]),
+        # OTU97 (de novo + primary)
+        "qiime2/otu97/otu97-table.qza",
+        "qiime2/otu97/otu97-rep-seqs.qza",
+        "qiime2/otu97/taxonomy_otu97_primary.qza",
+        expand("qiime2/summary/otu97_{rank}.tsv",         rank=["phylum","family","genus","species"]),
+        expand("qiime2/summary/otu97_{rank}.relabund.tsv",rank=["phylum","family","genus","species"]),
+        expand("qiime2/summary/otu97_{rank}.long.tsv",    rank=["phylum","family","genus","species"])
+        # 若需把 GG2/SEPP/Concordance 也并到 all，可按需追加
 
-rule otu97_gg2_open_taxonomy:
-    input:
-        reps="qiime2/otu97_gg2_open/otu97-rep-seqs.qza",
-        classifier=str(GG2_CLASSIFIER)
-    output:
-        tax="qiime2/otu97_gg2_open/taxonomy_otu97_gg2.qza"
-    conda: "workflow/envs/qiime2.yaml" if not USE_EXISTING_QIIME else None
-    shell:
-        r"""
-        {Q2} feature-classifier classify-sklearn \
-          --i-classifier {input.classifier} \
-          --i-reads {input.reps} \
-          --o-classification {output.tax}
-        """
-
-rule otu97_gg2_open_level_table:
-    input:
-        table_qza="qiime2/otu97_gg2_open/otu97-table.qza",
-        tax_qza  ="qiime2/otu97_gg2_open/taxonomy_otu97_gg2.qza"
-    output:
-        tsv="qiime2/summary/otu97_gg2_open_{rank}.tsv"
-    params:
-        rank=lambda wc: wc.rank
-    conda: None
-    shell:
-        r"""
-        set -euo pipefail
-        TMP=qiime2/summary/_tmp_otu97_gg2_open_{wildcards.rank}
-        mkdir -p "$TMP/tab" "$TMP/tax"
-        {Q2} tools export --input-path {input.table_qza} --output-path "$TMP/tab"
-        conda run -n {QIIME_ENV_NAME} biom convert \
-          -i "$TMP/tab/feature-table.biom" \
-          -o "$TMP/otu-table.tsv" --to-tsv
-        {Q2} tools export --input-path {input.tax_qza} --output-path "$TMP/tax"
-        conda run -n {QIIME_ENV_NAME} python workflow/scripts/rank_wide.py \
-          --table-tsv "$TMP/otu-table.tsv" \
-          --tax-tsv   "$TMP/tax/taxonomy.tsv" \
-          --rank {params.rank} \
-          --output {output.tsv}
-        """
-
-# -------- OTU97 taxonomy with primary classifier (SILVA) --------
-rule otu97_taxonomy_primary:
-    input:
-        reps="qiime2/otu97/otu97-rep-seqs.qza",
-        classifier=str(primary_classifier)
-    output:
-        tax="qiime2/otu97/taxonomy_otu97_primary.qza"
-    conda: "workflow/envs/qiime2.yaml" if not USE_EXISTING_QIIME else None
-    shell:
-        r"""
-        {Q2} feature-classifier classify-sklearn \
-          --i-classifier {input.classifier} \
-          --i-reads {input.reps} \
-          --o-classification {output.tax}
-        """
-
-# ------------- Phylogeny via SEPP (GG2 non-V4 backbone) -------------
-sepp_ok = bool(GG2_SEPP_REF)
-
-if sepp_ok:
-    rule gg2_nonv4_sepp_insertion:
-        input:
-            reps = "qiime2/rep-seqs.qza",
-            ref  = str(GG2_SEPP_REF)
-        output:
-            tree = "qiime2/trees/gg2_nonv4_sepp/insertion-tree.qza",
-            plc  = "qiime2/trees/gg2_nonv4_sepp/placements.qza"
-        threads: 8
-        conda: "workflow/envs/qiime2.yaml" if not USE_EXISTING_QIIME else None
-        shell:
-            r"""
-            set -euo pipefail
-            mkdir -p qiime2/trees/gg2_nonv4_sepp
-            {Q2} fragment-insertion sepp \
-              --i-representative-sequences {input.reps} \
-              --i-reference-database      {input.ref}  \
-              --p-threads {threads} \
-              --o-tree       {output.tree} \
-              --o-placements {output.plc}
-            """
-
-    rule export_sepp_tree_newick:
-        input: "qiime2/trees/gg2_nonv4_sepp/insertion-tree.qza"
-        output: "qiime2/trees/gg2_nonv4_sepp/insertion-tree.nwk"
-        conda: "workflow/envs/qiime2.yaml" if not USE_EXISTING_QIIME else None
-        shell:
-            r"""
-            {Q2} tools export --input-path {input} --output-path qiime2/trees/gg2_nonv4_sepp/_export
-            mv qiime2/trees/gg2_nonv4_sepp/_export/tree.nwk {output}
-            rm -rf qiime2/trees/gg2_nonv4_sepp/_export
-            """
-
-# =====================================================================
-#                 ASV & OTU SUMMARY WIDE TABLES
-# =====================================================================
-# --- ASV summaries per rank (phylum/family/genus/species) ---
-# 直接从 table.qza + taxonomy_primary.qza 自导出临时 TSV，再汇总成宽表。
-rule asv_level_table:
-    input:
-        table_qza="qiime2/table.qza",
-        tax_qza="qiime2/taxonomy/taxonomy_primary.qza"
-    output:
-        tsv = "qiime2/summary/asv_{rank,phylum|family|genus|species}.tsv"
-    params:
-        rank = lambda wc: wc.rank  # phylum/family/genus/species
-    conda: None
-    shell:
-        r"""
-        set -euo pipefail
-        TMP=qiime2/summary/_tmp_asv_{wildcards.rank}
-        mkdir -p "$TMP/tab" "$TMP/tax"
-        # 导出 QZA → TSV
-        {Q2} tools export --input-path {input.table_qza} --output-path "$TMP/tab"
-        conda run -n {QIIME_ENV_NAME} biom convert \
-          -i "$TMP/tab/feature-table.biom" \
-          -o "$TMP/feature-table.tsv" --to-tsv
-        {Q2} tools export --input-path {input.tax_qza} --output-path "$TMP/tax"
-
-        # 用独立脚本生成宽表
-        conda run -n {QIIME_ENV_NAME} python workflow/scripts/rank_wide.py \
-          --table-tsv "$TMP/feature-table.tsv" \
-          --tax-tsv "$TMP/tax/taxonomy.tsv" \
-          --rank {params.rank} \
-          --output {output.tsv}
-        """
-
-# --- 97% OTU (de novo) + taxonomy + per-rank summaries ---
-rule otu97_level_table:
-    input:
-        table_qza="qiime2/otu97/otu97-table.qza",
-        tax_qza  ="qiime2/otu97/taxonomy_otu97_primary.qza"
-    output:
-        tsv="qiime2/summary/otu97_{rank,phylum|family|genus|species}.tsv"
-    params:
-        rank=lambda wc: wc.rank
-    conda: None
-    shell:
-        r"""
-        set -euo pipefail
-        TMP=qiime2/summary/_tmp_otu97_{wildcards.rank}
-        mkdir -p "$TMP/tab" "$TMP/tax"
-        {Q2} tools export --input-path {input.table_qza} --output-path "$TMP/tab"
-        conda run -n {QIIME_ENV_NAME} biom convert \
-          -i "$TMP/tab/feature-table.biom" \
-          -o "$TMP/otu-table.tsv" --to-tsv
-        {Q2} tools export --input-path {input.tax_qza} --output-path "$TMP/tax"
-
-        conda run -n {QIIME_ENV_NAME} python workflow/scripts/rank_wide.py \
-          --table-tsv "$TMP/otu-table.tsv" \
-          --tax-tsv "$TMP/tax/taxonomy.tsv" \
-          --rank {params.rank} \
-          --output {output.tsv}
-        """
-
-# --- ASV → 相对丰度 + 长表 ---
-rule asv_post_rank:
-    input:
-        wide = "qiime2/summary/asv_{rank}.tsv",
-        meta = str(META)
-    output:
-        rel  = "qiime2/summary/asv_{rank}.relabund.tsv",
-        long = "qiime2/summary/asv_{rank}.long.tsv"
-    params:
-        group = cfg.get("summary", {}).get("group_column", "group")  # 按需在 config.yaml 里设定
-    conda: None
-    shell:
-        r"""
-        conda run -n {QIIME_ENV_NAME} python workflow/scripts/wide_post.py \
-          --wide-tsv {input.wide} \
-          --metadata {input.meta} \
-          --group-col {params.group} \
-          --out-rel  {output.rel} \
-          --out-long {output.long}
-        """
-
-# --- OTU97 → 相对丰度 + 长表 ---
-rule otu97_post_rank:
-    input:
-        wide = "qiime2/summary/otu97_{rank}.tsv",
-        meta = str(META)
-    output:
-        rel  = "qiime2/summary/otu97_{rank}.relabund.tsv",
-        long = "qiime2/summary/otu97_{rank}.long.tsv"
-    params:
-        group = cfg.get("summary", {}).get("group_column", "group")
-    conda: None
-    shell:
-        r"""
-        conda run -n {QIIME_ENV_NAME} python workflow/scripts/wide_post.py \
-          --wide-tsv {input.wide} \
-          --metadata {input.meta} \
-          --group-col {params.group} \
-          --out-rel  {output.rel} \
-          --out-long {output.long}
-        """
