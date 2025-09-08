@@ -3,6 +3,8 @@ Endosymbiont 16S V3–V4 Workflow (**Snakemake + QIIME 2 [https://qiime2.org/]**
 Reproducible pipeline for bark & ambrosia beetle **endosymbiont** 16S amplicons.
 Raw FASTQs → QC/denoise (DADA2) → taxonomy (**SILVA [https://www.arb-silva.de/]** primary; optional **Greengenes2（GG2）[https://greengenes2.ucsd.edu/]** cross-check) → ASV/OTU97 wide/long/rel-abundance tables → optional phylogeny.
 
+[![CI](https://github.com/dongyiyi/endosymbiont_workflow/actions/workflows/ci.yml/badge.svg)](https://github.com/dongyiyi/endosymbiont_workflow/actions/workflows/ci.yml)
+
 ## 1) Requirements
 
 **Conda/Mamba** (recommended)
