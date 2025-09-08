@@ -72,16 +72,16 @@ r2_bases = { _strip_suffix(p.name, R2SFX) for p in Path(RAW_DIR).glob(f"*{R2SFX}
 SAMPLES = sorted({s for s in r1_bases.intersection(r2_bases) if s})
 
 if len(SAMPLES) == 0:
-    # 明确报错，避免“空跑”
+    # 
     raise AssertionError(f"No samples found in {RAW_DIR} matching *{R1SFX} and *{R2SFX}")
 
 # --------------- Wildcard constraints ---------------
-# (ASV/OTU 物种层级汇总规则使用)
+# (ASV/OTU )
 wildcard_constraints:
     rank="phylum|family|genus|species"
 
 # ====================================================
-# QC (FastQC/MultiQC)  —— 可选；若不用可不设为 target
+# QC (FastQC/MultiQC)  ——
 # ====================================================
 rule fastqc:
     input:
@@ -215,7 +215,7 @@ rule taxonomy_primary:
         """
 
 # ----------------------------------------------------
-# TSV Exports (always available; 在 if use_gg2 外面)
+# TSV Exports (always available)
 # ----------------------------------------------------
 rule export_taxonomy_primary_tsv:
     input: "qiime2/taxonomy/taxonomy_primary.qza"
@@ -241,7 +241,7 @@ rule export_table_tsv:
         """
 
 # ====================================================
-# ASV → 宽表 +（相对丰度、长表）
+# ASV 
 # ====================================================
 rule asv_level_table:
     input:
@@ -287,7 +287,7 @@ rule asv_post_rank:
         """
 
 # ====================================================
-# OTU97（de novo, vsearch）→ Primary SILVA 分类 + 宽表/长表
+# OTU97（de novo, vsearch）→ Primary SILVA 
 # ====================================================
 rule otu97_cluster_denovo:
     input:
@@ -365,7 +365,7 @@ rule otu97_primary_post_rank:
         """
 
 # ====================================================
-# GG2 Cross-check（ASV/OTU97 with GG2 taxonomy）—— 可选
+# GG2 Cross-check（ASV/OTU97 with GG2 taxonomy）
 # ====================================================
 if use_gg2:
 
@@ -395,7 +395,7 @@ if use_gg2:
             rm -rf qiime2/taxonomy/_export_gg2
             """
 
-    # ---- ASV with GG2 taxonomy → 宽表/后处理 ----
+    # ---- ASV with GG2 taxonomy ----
     rule asv_level_table_gg2:
         input:
             table_qza="qiime2/table.qza",
@@ -511,7 +511,7 @@ if use_gg2:
               --o-classification {output.tax}
             """
 
-    # OTU97 (GG2) → 宽表/后处理
+    # OTU97 (GG2)
     rule otu97_gg2_level_table_closed:
         input:
             table_qza="qiime2/otu97gg2/closed-table.qza",
@@ -598,7 +598,7 @@ if use_gg2:
               --out-long {output.long}
             """
 
-    # Concordance top-N（依赖两份 taxonomy TSV）
+    # Concordance top-N（taxonomy TSV）
     rule concordance_top:
         input:
             table_tsv="qiime2/feature-table.tsv",
@@ -610,7 +610,7 @@ if use_gg2:
         script:
             "workflow/scripts/concordance.py"
 
-    # （可选）SEPP insertion tree with GG2 non-V4 backbone
+    # SEPP insertion tree with GG2 non-V4 backbone
     if GG2_SEPP_REF:
         rule gg2_nonv4_sepp_insertion:
             input:
@@ -641,9 +641,9 @@ if use_gg2:
                 """
 
 # ====================================================
-# (可选) 构建分类器（SILVA / GG2）
+# （SILVA / GG2）
 # ====================================================
-# —— SILVA —— 与你现有的 refs/get_silva_classifier.sh 配合
+# —— SILVA ——  refs/get_silva_classifier.sh 
 rule build_classifier_silva:
     output:
         classifier=f"refs/{region_label}-silva-{silva_version}/silva-{silva_version}-{region_label}-uniq-classifier.qza",
@@ -658,7 +658,7 @@ rule build_classifier_silva:
         bash refs/get_silva_classifier.sh {params.region} '{params.fwd}' '{params.rev}' {params.ver} {params.symb}
         """
 
-# —— GG2 —— 你此前已提供 refs/GG2-raw/*.qza 并在外部脚本构建
+# —— GG2 ——  refs/GG2-raw/*.qza 
 rule build_classifier_gg2:
     input:
         seqs = GG2_SEQS,
@@ -701,15 +701,15 @@ rule build_classifier_gg2:
 # ====================================================
 rule all:
     input:
-        # 基本核心产物
+        # 
         "qiime2/table.qza",
         "qiime2/rep-seqs.qza",
         "qiime2/demux.qzv",
         "qiime2/taxonomy/taxonomy_primary.qza",
         "qiime2/taxonomy/taxa-barplot_primary.qzv",
-        # ASV 宽表
+        # ASV 
         expand("qiime2/summary/asv_{rank}.tsv", rank=["phylum","family","genus","species"]),
-        # ASV 后处理
+        # ASV 
         expand("qiime2/summary/asv_{rank}.relabund.tsv", rank=["phylum","family","genus","species"]),
         expand("qiime2/summary/asv_{rank}.long.tsv",     rank=["phylum","family","genus","species"]),
         # OTU97 (de novo + primary)
@@ -719,5 +719,4 @@ rule all:
         expand("qiime2/summary/otu97_{rank}.tsv",         rank=["phylum","family","genus","species"]),
         expand("qiime2/summary/otu97_{rank}.relabund.tsv",rank=["phylum","family","genus","species"]),
         expand("qiime2/summary/otu97_{rank}.long.tsv",    rank=["phylum","family","genus","species"])
-        # 若需把 GG2/SEPP/Concordance 也并到 all，可按需追加
-
+        
