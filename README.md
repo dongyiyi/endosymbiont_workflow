@@ -433,7 +433,7 @@ Ensure `metadata/sample-metadata.tsv` is **tab-separated** with first column `sa
 
 **Primer consistency**: if primers change, **retrain** SILVA & GG2 classifiers.
 
-## 9) Notes for methods / reviewers
+## 9) Notes
 
 **Primary taxonomy**: SILVA V3–V4 classifier trained from SSURef NR99 138.2 via RESCRIPt (extract → dereplicate uniq → train).
 
