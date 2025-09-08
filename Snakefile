@@ -661,8 +661,8 @@ rule build_classifier_silva:
 # —— GG2 ——  refs/GG2-raw/*.qza 
 rule build_classifier_gg2:
     input:
-        seqs = GG2_SEQS,
-        tax  = GG2_TAX
+        seqs = str(GG2_SEQS),
+        tax  = str(GG2_TAX)
     output:
         classifier=str(GG2_DIR / "V3V4-uniq-classifier.qza")
     params:
