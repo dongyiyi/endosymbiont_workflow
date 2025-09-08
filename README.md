@@ -288,6 +288,27 @@ conda run -n snakemake snakemake \
   qiime2/trees/gg2_nonv4_sepp/placements.qza \
   qiime2/trees/gg2_nonv4_sepp/insertion-tree.nwk
 ```
+### 5.7 Closed-reference against GG2 （optional)
+```
+conda run -n snakemake snakemake \
+  --configfile workflow/config.yaml --cores 8 --use-conda --printshellcmds \
+  qiime2/otu97_gg2_closed/otu97-table.qza \
+  qiime2/otu97_gg2_closed/otu97-rep-seqs.qza \
+  qiime2/otu97_gg2_closed/taxonomy_otu97_gg2.qza \
+  qiime2/summary/otu97_gg2_closed_genus.tsv \
+  qiime2/summary/otu97_gg2_closed_species.tsv
+```
+
+**Open-reference against GG2（optional)**
+```
+conda run -n snakemake snakemake \
+  --configfile workflow/config.yaml --cores 8 --use-conda --printshellcmds \
+  qiime2/otu97_gg2_open/otu97-table.qza \
+  qiime2/otu97_gg2_open/otu97-rep-seqs.qza \
+  qiime2/otu97_gg2_open/taxonomy_otu97_gg2.qza \
+  qiime2/summary/otu97_gg2_open_genus.tsv \
+  qiime2/summary/otu97_gg2_open_species.tsv
+  ```
 ## 6) One-command “run all” script
 
 Create `run_all.sh` and make it executable (`chmod +x run_all.sh`):
