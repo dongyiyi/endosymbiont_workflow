@@ -316,65 +316,105 @@ Create `run_all.sh` and make it executable (`chmod +x run_all.sh`):
 #!/usr/bin/env bash
 set -euo pipefail
 
+# --------------------- knobs ---------------------
 CONFIG="${CONFIG:-workflow/config.yaml}"
 CORES="${CORES:-8}"
 WITH_GG2="${WITH_GG2:-no}"     # yes/no
-WITH_TREE="${WITH_TREE:-no}"   # yes/no
+WITH_TREE="${WITH_TREE:-no}"   # yes/no  (requires gg2.sepp_ref_qza in config)
 EXTRA_ARGS="${EXTRA_ARGS:-}"   # e.g. "--rerun-incomplete --keep-going"
 
+# 4 taxonomic ranks we summarize at:
+RANKS=(phylum family genus species)
+
+# ------------------ core targets -----------------
 CORE_TARGETS=(
+  # import / denoise / basic viz
   qiime2/demux.qzv
   qiime2/table.qza
   qiime2/rep-seqs.qza
+
+  # primary (SILVA) taxonomy & barplot
+  qiime2/taxonomy/taxonomy_primary.qza
   qiime2/taxonomy/taxa-barplot_primary.qzv
+
+  # exports needed by downstream summaries / concordance
   qiime2/taxonomy/taxonomy_primary.tsv
   qiime2/feature-table.tsv
 
-  qiime2/summary/asv_genus.tsv
-  qiime2/summary/asv_genus.long.tsv
-  qiime2/summary/asv_genus.relabund.tsv
-  qiime2/summary/asv_species.tsv
-  qiime2/summary/asv_species.long.tsv
-  qiime2/summary/asv_species.relabund.tsv
-
+  # OTU97 (de novo, primary SILVA taxonomy happens later)
   qiime2/otu97/otu97-table.qza
   qiime2/otu97/otu97-rep-seqs.qza
-  qiime2/summary/otu97_genus.tsv
-  qiime2/summary/otu97_genus.long.tsv
-  qiime2/summary/otu97_genus.relabund.tsv
-  qiime2/summary/otu97_species.tsv
-  qiime2/summary/otu97_species.long.tsv
-  qiime2/summary/otu97_species.relabund.tsv
-
-  qiime2/concordance/top50_concordance.csv
+  qiime2/otu97/taxonomy_otu97_primary.qza
 )
 
+# ASV wide/long/relabund (primary SILVA)
+for r in "${RANKS[@]}"; do
+  CORE_TARGETS+=(
+    "qiime2/summary/asv_${r}.tsv"
+    "qiime2/summary/asv_${r}.long.tsv"
+    "qiime2/summary/asv_${r}.relabund.tsv"
+  )
+done
+
+# OTU97 wide/long/relabund (primary SILVA)
+for r in "${RANKS[@]}"; do
+  CORE_TARGETS+=(
+    "qiime2/summary/otu97_${r}.tsv"
+    "qiime2/summary/otu97_${r}.long.tsv"
+    "qiime2/summary/otu97_${r}.relabund.tsv"
+  )
+done
+
+# ------------------ gg2 targets ------------------
 GG2_TARGETS=(
+  # ASV annotated by GG2
   qiime2/taxonomy/taxonomy_gg2.qza
   qiime2/taxonomy/taxonomy_gg2.tsv
-
-  qiime2/summary/asv_gg2_genus.tsv
-  qiime2/summary/asv_gg2_genus.long.tsv
-  qiime2/summary/asv_gg2_genus.relabund.tsv
-  qiime2/summary/asv_gg2_species.tsv
-  qiime2/summary/asv_gg2_species.long.tsv
-  qiime2/summary/asv_gg2_species.relabund.tsv
-
-  qiime2/otu97/taxonomy_otu97_gg2.qza
-  qiime2/summary/otu97_gg2_genus.tsv
-  qiime2/summary/otu97_gg2_genus.long.tsv
-  qiime2/summary/otu97_gg2_genus.relabund.tsv
-  qiime2/summary/otu97_gg2_species.tsv
-  qiime2/summary/otu97_gg2_species.long.tsv
-  qiime2/summary/otu97_gg2_species.relabund.tsv
 )
 
+# ASV (GG2) summaries
+for r in "${RANKS[@]}"; do
+  GG2_TARGETS+=(
+    "qiime2/summary/asv_gg2_${r}.tsv"
+    "qiime2/summary/asv_gg2_${r}.long.tsv"
+    "qiime2/summary/asv_gg2_${r}.relabund.tsv"
+  )
+done
+
+# OTU97 clustered against GG2 reference (closed & open)
+GG2_TARGETS+=(
+  qiime2/otu97gg2/closed-table.qza
+  qiime2/otu97gg2/closed-rep-seqs.qza
+  qiime2/otu97gg2/taxonomy_closed_gg2.qza
+
+  qiime2/otu97gg2/open-table.qza
+  qiime2/otu97gg2/open-rep-seqs.qza
+  qiime2/otu97gg2/taxonomy_open_gg2.qza
+)
+
+# OTU97 (GG2) summaries for closed/open
+for mode in closed open; do
+  for r in "${RANKS[@]}"; do
+    GG2_TARGETS+=(
+      "qiime2/summary/otu97_gg2_${mode}_${r}.tsv"
+      "qiime2/summary/otu97_gg2_${mode}_${r}.long.tsv"
+      "qiime2/summary/otu97_gg2_${mode}_${r}.relabund.tsv"
+    )
+  done
+done
+
+# Concordance (needs both SILVA and GG2 taxonomy TSVs)
+GG2_TARGETS+=("qiime2/concordance/top50_concordance.csv")
+
+# -------------------- tree targets ----------------
+# Only available when gg2.sepp_ref_qza is set in config (Snakefile 有条件定义)
 TREE_TARGETS=(
   qiime2/trees/gg2_nonv4_sepp/insertion-tree.qza
   qiime2/trees/gg2_nonv4_sepp/placements.qza
-  qiime2/trees/gg2_nonv4_sepp/insertion-tree.nwk
+  qiime2/trees/gg2_nonv4_sepp/tree.nwk
 )
 
+# ----------------- assemble and run ----------------
 TARGETS=("${CORE_TARGETS[@]}")
 [[ "${WITH_GG2}" == "yes" ]]  && TARGETS+=("${GG2_TARGETS[@]}")
 [[ "${WITH_TREE}" == "yes" ]] && TARGETS+=("${TREE_TARGETS[@]}")
@@ -385,6 +425,7 @@ conda run -n snakemake snakemake \
   --cores "${CORES}" \
   --use-conda --printshellcmds ${EXTRA_ARGS} \
   "${TARGETS[@]}"
+
 ```
 
 Usage:
