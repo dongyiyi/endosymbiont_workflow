@@ -299,7 +299,7 @@ conda run -n snakemake snakemake \
   qiime2/summary/otu97_gg2_closed_species.tsv
 ```
 
-**Open-reference against GG2（optional)**
+### 5.8 Open-reference against GG2（optional)
 ```
 conda run -n snakemake snakemake \
   --configfile workflow/config.yaml --cores 8 --use-conda --printshellcmds \
