@@ -593,4 +593,3 @@ Ensure `metadata/sample-metadata.tsv` is **tab-separated** with first column `sa
 
 **Rationale for** `symbiont_taxa.txt`: a curated endosymbiont list enabling (i) optional focused classifier and (ii) fast downstream subsetting of symbiont lineages for ecological analyses.
 
-**Consensus handling** (optional, if enabled in your Snakefile): we provide per-DB tables and a concordance summary; a conservative consensus table can be produced that marks disagreements as `Unresolved@rank` (or applies genus-level fallback policies if configured).
