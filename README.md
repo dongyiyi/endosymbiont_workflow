@@ -290,159 +290,247 @@ conda run -n snakemake snakemake \
   qiime2/trees/gg2_nonv4_sepp/placements.qza \
   qiime2/trees/gg2_nonv4_sepp/insertion-tree.nwk
 ```
-### 5.7 Closed-reference against GG2 （optional)
-```
-conda run -n snakemake snakemake \
-  --configfile workflow/config.yaml --cores 8 --use-conda --printshellcmds \
-  qiime2/otu97_gg2_closed/otu97-table.qza \
-  qiime2/otu97_gg2_closed/otu97-rep-seqs.qza \
-  qiime2/otu97_gg2_closed/taxonomy_otu97_gg2.qza \
-  qiime2/summary/otu97_gg2_closed_genus.tsv \
-  qiime2/summary/otu97_gg2_closed_species.tsv
-```
 
-### 5.8 Open-reference against GG2（optional)
-```
-conda run -n snakemake snakemake \
-  --configfile workflow/config.yaml --cores 8 --use-conda --printshellcmds \
-  qiime2/otu97_gg2_open/otu97-table.qza \
-  qiime2/otu97_gg2_open/otu97-rep-seqs.qza \
-  qiime2/otu97_gg2_open/taxonomy_otu97_gg2.qza \
-  qiime2/summary/otu97_gg2_open_genus.tsv \
-  qiime2/summary/otu97_gg2_open_species.tsv
-  ```
 ## 6) One-command “run all” script
 
 Create `run_all.sh` and make it executable (`chmod +x run_all.sh`):
 ```
 #!/usr/bin/env bash
+#SBATCH --job-name=endsymbiont_runall
+#SBATCH --output=logs/run_all.%j.out
+#SBATCH --error=logs/run_all.%j.err
+#SBATCH --time=48:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+
 set -euo pipefail
 
-# --------------------- knobs ---------------------
-CONFIG="${CONFIG:-workflow/config.yaml}"
-CORES="${CORES:-8}"
-WITH_GG2="${WITH_GG2:-no}"     # yes/no
-WITH_TREE="${WITH_TREE:-no}"   # yes/no  (requires gg2.sepp_ref_qza in config)
-EXTRA_ARGS="${EXTRA_ARGS:-}"   # e.g. "--rerun-incomplete --keep-going"
+# -----------------------------
+# Config (edit if needed)
+# -----------------------------
+SNAKEMAKE_ENV="snakemake"
+QIIME_ENV="qiime2-amplicon-2024.10"
+R_ENV="r-microbiome"
 
-# 4 taxonomic ranks we summarize at:
-RANKS=(phylum family genus species)
+CONFIG="workflow/config.yaml"
+SNAKE1="Snakefile"
+SNAKE2="Snakefile_v2"
 
-# ------------------ core targets -----------------
-CORE_TARGETS=(
-  # import / denoise / basic viz
-  qiime2/demux.qzv
-  qiime2/table.qza
-  qiime2/rep-seqs.qza
+META_BASIC="metadata/sample-metadata.tsv"
+META_DETAIL="metadata/sample-metadata_details.tsv"
 
-  # primary (SILVA) taxonomy & barplot
-  qiime2/taxonomy/taxonomy_primary.qza
-  qiime2/taxonomy/taxa-barplot_primary.qzv
+# Sampling depth for rarefaction/core-metrics (your final choice)
+SAMPLING_DEPTH="500000"
 
-  # exports needed by downstream summaries / concordance
-  qiime2/taxonomy/taxonomy_primary.tsv
-  qiime2/feature-table.tsv
+# Where to store outputs
+mkdir -p logs
 
-  # OTU97 (de novo, primary SILVA taxonomy happens later)
-  qiime2/otu97/otu97-table.qza
-  qiime2/otu97/otu97-rep-seqs.qza
-  qiime2/otu97/taxonomy_otu97_primary.qza
-)
+# Use Slurm cores if available, otherwise fallback
+CORES="${SLURM_CPUS_PER_TASK:-8}"
 
-# ASV wide/long/relabund (primary SILVA)
-for r in "${RANKS[@]}"; do
-  CORE_TARGETS+=(
-    "qiime2/summary/asv_${r}.tsv"
-    "qiime2/summary/asv_${r}.long.tsv"
-    "qiime2/summary/asv_${r}.relabund.tsv"
-  )
+echo "[INFO] Start run_all.sh at: $(date)"
+echo "[INFO] Using CORES=${CORES}"
+echo "[INFO] Using SAMPLING_DEPTH=${SAMPLING_DEPTH}"
+
+# -----------------------------
+# Helper: run snakemake safely
+# -----------------------------
+run_snakemake () {
+  local snakefile="$1"
+  echo "[INFO] Running Snakemake with ${snakefile}"
+  conda run -n "${SNAKEMAKE_ENV}" snakemake \
+    --snakefile "${snakefile}" \
+    --configfile "${CONFIG}" \
+    --cores "${CORES}" \
+    --use-conda \
+    --printshellcmds \
+    --rerun-incomplete \
+    --rerun-triggers mtime
+}
+
+# -----------------------------
+# 1) Main pipeline (Snakefile)
+# -----------------------------
+if [[ -f "${SNAKE1}" ]]; then
+  run_snakemake "${SNAKE1}"
+else
+  echo "[WARN] ${SNAKE1} not found; skipping."
+fi
+
+# -----------------------------
+# 2) Additional/updated rules (Snakefile_v2)
+# -----------------------------
+if [[ -f "${SNAKE2}" ]]; then
+  run_snakemake "${SNAKE2}"
+else
+  echo "[WARN] ${SNAKE2} not found; skipping."
+fi
+
+# -----------------------------
+# 3) Post-QIIME2 summaries you ran manually
+#    - These do NOT affect existing results unless output filenames collide.
+# -----------------------------
+mkdir -p qiime2/summary
+
+# DADA2 stats tabulate/export (safe: writes new qzv folder)
+if [[ -f "qiime2/denoise-stats.qza" ]]; then
+  echo "[INFO] QIIME2: metadata tabulate denoise-stats"
+  conda run -n "${QIIME_ENV}" qiime metadata tabulate \
+    --m-input-file qiime2/denoise-stats.qza \
+    --o-visualization qiime2/summary/denoise-stats.qzv
+
+  echo "[INFO] QIIME2: export denoise-stats"
+  rm -rf qiime2/summary/_export_denoise_stats || true
+  conda run -n "${QIIME_ENV}" qiime tools export \
+    --input-path qiime2/denoise-stats.qza \
+    --output-path qiime2/summary/_export_denoise_stats
+else
+  echo "[WARN] qiime2/denoise-stats.qza not found; skip denoise-stats export."
+fi
+
+# Feature-table summary (safe: new qzv)
+if [[ -f "qiime2/table.qza" ]]; then
+  echo "[INFO] QIIME2: feature-table summarize"
+  # Prefer detail metadata if exists; fallback to basic
+  META_USE="${META_DETAIL}"
+  if [[ ! -f "${META_USE}" ]]; then META_USE="${META_BASIC}"; fi
+
+  conda run -n "${QIIME_ENV}" qiime feature-table summarize \
+    --i-table qiime2/table.qza \
+    --m-sample-metadata-file "${META_USE}" \
+    --o-visualization qiime2/summary/table_summary.qzv
+else
+  echo "[WARN] qiime2/table.qza not found; skip feature-table summarize."
+fi
+
+# -----------------------------
+# 4) Phylogeny (align-to-tree-mafft-fasttree)
+#    - Avoid re-running if all outputs validate.
+# -----------------------------
+mkdir -p qiime2/trees
+
+need_phylo="0"
+for f in qiime2/trees/aligned-rep-seqs.qza \
+         qiime2/trees/masked-aligned-rep-seqs.qza \
+         qiime2/trees/unrooted-tree.qza \
+         qiime2/trees/rooted-tree.qza
+do
+  if [[ ! -f "$f" ]]; then
+    need_phylo="1"
+  fi
 done
 
-# OTU97 wide/long/relabund (primary SILVA)
-for r in "${RANKS[@]}"; do
-  CORE_TARGETS+=(
-    "qiime2/summary/otu97_${r}.tsv"
-    "qiime2/summary/otu97_${r}.long.tsv"
-    "qiime2/summary/otu97_${r}.relabund.tsv"
-  )
-done
+if [[ "${need_phylo}" == "1" ]]; then
+  if [[ -f "qiime2/rep-seqs.qza" ]]; then
+    echo "[INFO] QIIME2: align-to-tree-mafft-fasttree (this can take long; run on compute node)"
+    conda run -n "${QIIME_ENV}" qiime phylogeny align-to-tree-mafft-fasttree \
+      --i-sequences qiime2/rep-seqs.qza \
+      --o-alignment qiime2/trees/aligned-rep-seqs.qza \
+      --o-masked-alignment qiime2/trees/masked-aligned-rep-seqs.qza \
+      --o-tree qiime2/trees/unrooted-tree.qza \
+      --o-rooted-tree qiime2/trees/rooted-tree.qza \
+      --p-n-threads "${CORES}"
+  else
+    echo "[WARN] qiime2/rep-seqs.qza not found; skip phylogeny build."
+  fi
+else
+  echo "[INFO] Phylogeny outputs already exist; validating..."
+  conda run -n "${QIIME_ENV}" qiime tools validate qiime2/trees/aligned-rep-seqs.qza || echo "[WARN] aligned invalid"
+  conda run -n "${QIIME_ENV}" qiime tools validate qiime2/trees/masked-aligned-rep-seqs.qza || echo "[WARN] masked invalid"
+  conda run -n "${QIIME_ENV}" qiime tools validate qiime2/trees/unrooted-tree.qza || echo "[WARN] unrooted invalid"
+  conda run -n "${QIIME_ENV}" qiime tools validate qiime2/trees/rooted-tree.qza || echo "[WARN] rooted invalid"
+fi
 
-# ------------------ gg2 targets ------------------
-GG2_TARGETS=(
-  # ASV annotated by GG2
-  qiime2/taxonomy/taxonomy_gg2.qza
-  qiime2/taxonomy/taxonomy_gg2.tsv
-)
+# -----------------------------
+# 5) Alpha rarefaction (500k) + export HTML
+# -----------------------------
+if [[ -f "qiime2/table.qza" && -f "qiime2/trees/rooted-tree.qza" ]]; then
+  META_USE="${META_DETAIL}"
+  if [[ ! -f "${META_USE}" ]]; then META_USE="${META_BASIC}"; fi
 
-# ASV (GG2) summaries
-for r in "${RANKS[@]}"; do
-  GG2_TARGETS+=(
-    "qiime2/summary/asv_gg2_${r}.tsv"
-    "qiime2/summary/asv_gg2_${r}.long.tsv"
-    "qiime2/summary/asv_gg2_${r}.relabund.tsv"
-  )
-done
+  echo "[INFO] QIIME2: alpha-rarefaction at depth ${SAMPLING_DEPTH}"
+  conda run -n "${QIIME_ENV}" qiime diversity alpha-rarefaction \
+    --i-table qiime2/table.qza \
+    --i-phylogeny qiime2/trees/rooted-tree.qza \
+    --m-metadata-file "${META_USE}" \
+    --p-max-depth "${SAMPLING_DEPTH}" \
+    --o-visualization "qiime2/summary/alpha_rarefaction_${SAMPLING_DEPTH}.qzv"
 
-# OTU97 clustered against GG2 reference (closed & open)
-GG2_TARGETS+=(
-  qiime2/otu97gg2/closed-table.qza
-  qiime2/otu97gg2/closed-rep-seqs.qza
-  qiime2/otu97gg2/taxonomy_closed_gg2.qza
+  echo "[INFO] Export alpha-rarefaction qzv -> HTML"
+  rm -rf "qiime2/summary/export_alpha_rarefaction_${SAMPLING_DEPTH}" || true
+  conda run -n "${QIIME_ENV}" qiime tools export \
+    --input-path "qiime2/summary/alpha_rarefaction_${SAMPLING_DEPTH}.qzv" \
+    --output-path "qiime2/summary/export_alpha_rarefaction_${SAMPLING_DEPTH}"
+else
+  echo "[WARN] Missing table/rooted tree; skip alpha-rarefaction."
+fi
 
-  qiime2/otu97gg2/open-table.qza
-  qiime2/otu97gg2/open-rep-seqs.qza
-  qiime2/otu97gg2/taxonomy_open_gg2.qza
-)
+# -----------------------------
+# 6) Core metrics phylogenetic (500k)
+# -----------------------------
+if [[ -f "qiime2/table.qza" && -f "qiime2/trees/rooted-tree.qza" ]]; then
+  META_USE="${META_DETAIL}"
+  if [[ ! -f "${META_USE}" ]]; then META_USE="${META_BASIC}"; fi
 
-# OTU97 (GG2) summaries for closed/open
-for mode in closed open; do
-  for r in "${RANKS[@]}"; do
-    GG2_TARGETS+=(
-      "qiime2/summary/otu97_gg2_${mode}_${r}.tsv"
-      "qiime2/summary/otu97_gg2_${mode}_${r}.long.tsv"
-      "qiime2/summary/otu97_gg2_${mode}_${r}.relabund.tsv"
-    )
-  done
-done
+  OUT_CORE="qiime2/diversity/core_phylo_${SAMPLING_DEPTH}"
+  if [[ ! -d "${OUT_CORE}" ]]; then
+    mkdir -p "$(dirname "${OUT_CORE}")"
+    echo "[INFO] QIIME2: core-metrics-phylogenetic at depth ${SAMPLING_DEPTH}"
+    conda run -n "${QIIME_ENV}" qiime diversity core-metrics-phylogenetic \
+      --i-table qiime2/table.qza \
+      --i-phylogeny qiime2/trees/rooted-tree.qza \
+      --m-metadata-file "${META_USE}" \
+      --p-sampling-depth "${SAMPLING_DEPTH}" \
+      --output-dir "${OUT_CORE}"
+  else
+    echo "[INFO] ${OUT_CORE} already exists; skip core-metrics."
+  fi
+else
+  echo "[WARN] Missing table/rooted tree; skip core-metrics-phylogenetic."
+fi
 
-# Concordance (needs both SILVA and GG2 taxonomy TSVs)
-GG2_TARGETS+=("qiime2/concordance/top50_concordance.csv")
+# -----------------------------
+# 7) R analyses (symbionts) you are running
+#    - Run only if scripts exist.
+# -----------------------------
+run_R () {
+  local script="$1"
+  if [[ -f "${script}" ]]; then
+    echo "[INFO] Running R script: ${script}"
+    conda run -n "${R_ENV}" Rscript "${script}"
+  else
+    echo "[WARN] R script not found: ${script}; skipping."
+  fi
+}
 
-# -------------------- tree targets ----------------
-# Only available when gg2.sepp_ref_qza is set in config (Snakefile 有条件定义)
-TREE_TARGETS=(
-  qiime2/trees/gg2_nonv4_sepp/insertion-tree.qza
-  qiime2/trees/gg2_nonv4_sepp/placements.qza
-  qiime2/trees/gg2_nonv4_sepp/tree.nwk
-)
+run_R "qiime2/analysis_symbiont/run_symbiont_region_ploidy.R"
+run_R "qiime2/analysis_symbiont/run_symbiont_presence_absence_extra.R"
+run_R "qiime2/analysis_symbiont/run_symbiont_presence_absence_models_v2.R"
 
-# ----------------- assemble and run ----------------
-TARGETS=("${CORE_TARGETS[@]}")
-[[ "${WITH_GG2}" == "yes" ]]  && TARGETS+=("${GG2_TARGETS[@]}")
-[[ "${WITH_TREE}" == "yes" ]] && TARGETS+=("${TREE_TARGETS[@]}")
+# (Optional) if you created these additional scripts
+run_R "qiime2/analysis_symbiont/run_symbiont_species_level.R"
+run_R "qiime2/analysis_symbiont/run_symbiont_conspecific_pairs.R"
+run_R "qiime2/analysis_symbiont/run_symbiont_presence_threshold_sensitivity.R"
 
-echo "[run_all] config=${CONFIG} cores=${CORES} gg2=${WITH_GG2} tree=${WITH_TREE}"
-conda run -n snakemake snakemake \
-  --configfile "${CONFIG}" \
-  --cores "${CORES}" \
-  --use-conda --printshellcmds ${EXTRA_ARGS} \
-  "${TARGETS[@]}"
+# -----------------------------
+# 8) Package results for download
+#    - Keep original folder
+#    - Exclude fastq and fastqc.zip as requested
+# -----------------------------
+# echo "[INFO] Packaging qiime2 -> qiime2_results.gz (excluding fastq.gz and fastqc.zip)"
+# tar -czf qiime2_results.gz \
+#   --exclude='*.fastq.gz' \
+#   --exclude='*fastqc.zip' \
+#   qiime2
 
-```
+# Optional extra excludes (uncomment if you want smaller archive)
+#   --exclude='qiime2/demux*' \
+#   --exclude='qiime2/*/cutadapt*' \
+#   --exclude='qiime2/**/_tmp_*' \
+#   --exclude='qiime2/**/_export*' \
 
-Usage:
-```
-# SILVA only
-./run_all.sh
-
-# + GG2 tables
-WITH_GG2=yes ./run_all.sh
-
-# + GG2 + phylogeny
-WITH_GG2=yes WITH_TREE=yes ./run_all.sh
-
-# Resume robustly after interruption
-EXTRA_ARGS="--rerun-incomplete --keep-going" ./run_all.sh
+echo "[INFO] Done at: $(date)"
+# echo "[INFO] Archive: qiime2_results.gz"
 ```
 ## 7) Outputs (high level)
 
