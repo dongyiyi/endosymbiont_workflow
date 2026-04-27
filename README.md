@@ -1,4 +1,5 @@
-# endosymbiont workflow [![CI](https://github.com/dongyiyi/endosymbiont_workflow/actions/workflows/ci.yml/badge.svg)](https://github.com/dongyiyi/endosymbiont_workflow/actions/workflows/ci.yml)
+# endosymbiont workflow 
+[![CI](https://github.com/dongyiyi/endosymbiont_workflow/actions/workflows/ci.yml/badge.svg)](https://github.com/dongyiyi/endosymbiont_workflow/actions/workflows/ci.yml)
 
 Endosymbiont 16S V3–V4 Workflow (**Snakemake + QIIME 2 [https://qiime2.org/]**)
 Reproducible pipeline for bark & ambrosia beetle **endosymbiont** 16S amplicons.
